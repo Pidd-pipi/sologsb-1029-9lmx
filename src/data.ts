@@ -108,6 +108,7 @@ export const createInitialState = (): PersistedState => ({
   },
   activeLessonId: '',
   activeSentenceId: '',
+  segmentPrefs: {},
   theme: 'light',
   fontScale: 1,
   role: 'learner'

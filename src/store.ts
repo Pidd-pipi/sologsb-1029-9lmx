@@ -1,6 +1,6 @@
 import { reactive, watch } from 'vue';
 import { createInitialState } from './data';
-import type { Lesson, PersistedState, PracticeAttempt } from './types';
+import type { Lesson, PersistedState, PracticeAttempt, SegmentPreference } from './types';
 
 const STORAGE_KEY = 'sologsb-1029-dictation-state-v1';
 
@@ -9,7 +9,10 @@ function loadState(): PersistedState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as PersistedState;
-      if (parsed.schemaVersion === 1) return parsed;
+      if (parsed.schemaVersion === 1) {
+        if (!parsed.segmentPrefs || typeof parsed.segmentPrefs !== 'object') parsed.segmentPrefs = {};
+        return parsed;
+      }
     }
   } catch {
     // Falls back to the sample course when the local draft is malformed.
@@ -37,6 +40,20 @@ export const courseForLesson = (lessonId: string) => state.courses.find((course)
 export function setDownloaded(lessonId: string, value: boolean) {
   const lesson = lessonById(lessonId);
   if (lesson) lesson.downloaded = value;
+}
+
+export function segmentPrefFor(sentenceId: string, wordCount: number): SegmentPreference {
+  const fallback: SegmentPreference = { start: 0, end: Math.max(0, wordCount - 1), rate: 0.8 };
+  const stored = state.segmentPrefs[sentenceId];
+  if (!stored || wordCount <= 0) return fallback;
+  const start = Math.min(Math.max(0, stored.start), wordCount - 1);
+  const end = Math.min(Math.max(start, stored.end), wordCount - 1);
+  const rate = stored.rate > 0 ? stored.rate : fallback.rate;
+  return { start, end, rate };
+}
+
+export function saveSegmentPref(sentenceId: string, pref: SegmentPreference) {
+  state.segmentPrefs[sentenceId] = pref;
 }
 
 export function saveAttempt(attempt: PracticeAttempt) {

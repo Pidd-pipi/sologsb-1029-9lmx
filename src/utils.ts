@@ -14,6 +14,8 @@ export const normalizeToken = (token: string): string => token
   .replaceAll('’', "'")
   .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 
+export const wordTokens = (text: string): TextSegment[] => segmentText(text).filter((token) => token.normalized);
+
 export function compareSentence(expected: string, answer: string): TokenResult[] {
   const expectedTokens = segmentText(expected);
   const actualTokens = segmentText(answer);

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
-import { compareSentence, scoreAttempt, segmentText } from './utils';
+import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, saveSegmentPref, segmentPrefFor, setDownloaded, state, updateTokenClassification } from './store';
+import { player, playOnce, refreshSpeechReason, startSegmentLoop, stopAllPlayback, watchVoices } from './speech';
+import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView, SentenceAttempt, TokenResult } from './types';
+import { compareSentence, normalizeToken, scoreAttempt, segmentText, wordTokens } from './utils';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
 const online = ref(navigator.onLine);
@@ -13,6 +14,10 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+const loopStart = ref(0);
+const loopEnd = ref(0);
+const loopRate = ref(0.8);
+const rateOptions = [0.6, 0.8, 1, 1.2];
 let toastTimer = 0;
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
@@ -36,6 +41,7 @@ const lessonCompletion = computed(() => {
 const resultAttempt = computed(() => state.attempts.find((attempt) => attempt.id === resultAttemptId.value));
 const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[selectedResultSentence.value]);
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
+const currentWords = computed(() => wordTokens(currentSentence.value?.text ?? ''));
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
 
@@ -48,11 +54,17 @@ const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'grammar', label: '语法' }
 ];
 
-watch(currentSentence, (sentence) => {
+watch(currentSentence, (sentence, previous) => {
+  if (sentence?.id !== previous?.id) stopAllPlayback();
   currentAnswer.value = sentence && activeProgress.value ? activeProgress.value.answers[sentence.id] ?? '' : '';
   segmentStart.value = 0;
   segmentEnd.value = sentence ? Math.max(0, segmentText(sentence.text).length - 1) : 0;
+  syncLoopPref();
 }, { immediate: true });
+
+watch(view, (next) => {
+  if (next !== 'practice') stopAllPlayback();
+});
 
 watch(currentAnswer, (value) => {
   const lesson = activeLesson.value;
@@ -86,7 +98,48 @@ function notify(message: string) {
   toastTimer = window.setTimeout(() => { toast.value = ''; }, 2400);
 }
 
+function syncLoopPref() {
+  const sentence = currentSentence.value;
+  if (!sentence) return;
+  const pref = segmentPrefFor(sentence.id, currentWords.value.length);
+  loopStart.value = pref.start;
+  loopEnd.value = pref.end;
+  loopRate.value = pref.rate;
+}
+
+function persistLoopPref() {
+  const sentence = currentSentence.value;
+  if (!sentence || !currentWords.value.length) return;
+  saveSegmentPref(sentence.id, { start: loopStart.value, end: loopEnd.value, rate: loopRate.value });
+}
+
+function clampLoopRange(changed: 'start' | 'end') {
+  if (changed === 'start' && loopEnd.value < loopStart.value) loopEnd.value = loopStart.value;
+  if (changed === 'end' && loopStart.value > loopEnd.value) loopStart.value = loopEnd.value;
+  persistLoopPref();
+}
+
+function setLoopRate(rate: number) {
+  loopRate.value = rate;
+  persistLoopPref();
+  if (player.looping) notify('语速已更新，当前一遍播完后生效');
+}
+
+function startLoop() {
+  if (!currentSentence.value) return;
+  persistLoopPref();
+  startSegmentLoop({
+    getText: () => currentWords.value.slice(loopStart.value, loopEnd.value + 1).map((word) => word.display).join(' '),
+    getRate: () => loopRate.value
+  }, notify);
+}
+
+function stopLoop() {
+  stopAllPlayback();
+}
+
 function startLesson(lesson: Lesson) {
+  stopAllPlayback();
   const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
   state.progress[lesson.id] = progress;
   state.activeLessonId = lesson.id;
@@ -111,6 +164,7 @@ function goToSentence(index: number) {
 }
 
 function submitLesson() {
+  stopAllPlayback();
   const lesson = activeLesson.value;
   const course = activeCourse.value;
   if (!lesson || !course) return;
@@ -154,15 +208,7 @@ function syncSegment() {
 }
 
 function replay(text: string, rate = 0.82) {
-  if (!('speechSynthesis' in window)) {
-    notify('当前浏览器不支持语音播放');
-    return;
-  }
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'en-US';
-  utterance.rate = rate;
-  window.speechSynthesis.speak(utterance);
+  playOnce(text, rate, notify);
 }
 
 function replaySegment() {
@@ -175,6 +221,47 @@ function replaySegment() {
 function selectResultSentence(index: number) {
   selectedResultSentence.value = index;
   syncSegment();
+}
+
+function sourceWordIndex(sentenceAttempt: SentenceAttempt, token: TokenResult): number {
+  const wordCount = wordTokens(sentenceAttempt.source).length;
+  const position = sentenceAttempt.tokens.indexOf(token);
+  let count = -1;
+  for (let i = 0; i <= position && i < sentenceAttempt.tokens.length; i += 1) {
+    const expected = sentenceAttempt.tokens[i].expected;
+    if (expected && normalizeToken(expected)) count += 1;
+  }
+  return Math.min(Math.max(count, 0), Math.max(0, wordCount - 1));
+}
+
+function bringErrorsToLoop(sentenceAttempt: SentenceAttempt, token?: TokenResult) {
+  const attempt = resultAttempt.value;
+  const lesson = attempt ? lessonById(attempt.lessonId) : undefined;
+  if (!attempt || !lesson) {
+    notify('未找到对应课程，无法带入练习');
+    return;
+  }
+  const wordCount = wordTokens(sentenceAttempt.source).length;
+  if (!wordCount) return;
+  let start: number;
+  let end: number;
+  if (token) {
+    start = sourceWordIndex(sentenceAttempt, token);
+    end = start;
+  } else {
+    const wrongTokens = sentenceAttempt.tokens.filter((item) => !item.correct);
+    if (!wrongTokens.length) return;
+    const indices = wrongTokens.map((item) => sourceWordIndex(sentenceAttempt, item));
+    start = Math.min(...indices);
+    end = Math.max(...indices);
+  }
+  const { rate } = segmentPrefFor(sentenceAttempt.sentenceId, wordCount);
+  saveSegmentPref(sentenceAttempt.sentenceId, { start, end, rate });
+  startLesson(lesson);
+  const sentenceIndex = lesson.sentences.findIndex((sentence) => sentence.id === sentenceAttempt.sentenceId);
+  goToSentence(sentenceIndex >= 0 ? sentenceIndex : 0);
+  syncLoopPref();
+  notify(token ? '已把该词带入练习页循环区间' : '已把全部错误词区间带入练习页');
 }
 
 function saveClassification(attemptId: string, sentenceId: string, tokenIndex: number, category: ErrorCategory, reason: string) {
@@ -219,21 +306,32 @@ function onConnectionChange() {
 }
 
 function onVisibilityChange() {
-  if (document.visibilityState === 'hidden') persist();
+  if (document.visibilityState === 'hidden') {
+    stopAllPlayback();
+    persist();
+  }
+}
+
+function onPageHide() {
+  stopAllPlayback();
+  persist();
 }
 
 onMounted(() => {
+  watchVoices();
+  refreshSpeechReason();
   window.addEventListener('online', onConnectionChange);
   window.addEventListener('offline', onConnectionChange);
   window.addEventListener('visibilitychange', onVisibilityChange);
-  window.addEventListener('pagehide', persist);
+  window.addEventListener('pagehide', onPageHide);
 });
 
 onBeforeUnmount(() => {
+  stopAllPlayback();
   window.removeEventListener('online', onConnectionChange);
   window.removeEventListener('offline', onConnectionChange);
   window.removeEventListener('visibilitychange', onVisibilityChange);
-  window.removeEventListener('pagehide', persist);
+  window.removeEventListener('pagehide', onPageHide);
   persist();
 });
 </script>
@@ -318,8 +416,35 @@ onBeforeUnmount(() => {
         <section class="audio-card">
           <div class="audio-meta">
             <button class="play-button" aria-label="播放当前句子" @click="replay(currentSentence?.text ?? '')">▶</button>
-            <div><strong>听写提示</strong><p>先完整播放，再输入你听到的英文。播放速度已放慢。</p></div>
+            <div><strong>听写提示</strong><p>先完整播放，再输入你听到的英文。听不清的小段可用下方片段循环。</p></div>
           </div>
+        </section>
+
+        <section class="loop-panel" aria-label="片段循环播放">
+          <div class="loop-head">
+            <strong>片段循环</strong>
+            <span v-if="player.looping">第 {{ player.pass + 1 }} 遍 · 循环中</span>
+            <span v-else>第 {{ loopStart + 1 }}–{{ loopEnd + 1 }} 词 · {{ loopRate }}×</span>
+          </div>
+          <div class="loop-grid">
+            <label class="loop-field">起点
+              <select v-model.number="loopStart" aria-label="起点词" @change="clampLoopRange('start')">
+                <option v-for="index in currentWords.length" :key="`start-${index}`" :value="index - 1">第 {{ index }} 词</option>
+              </select>
+            </label>
+            <label class="loop-field">终点
+              <select v-model.number="loopEnd" aria-label="终点词" @change="clampLoopRange('end')">
+                <option v-for="index in currentWords.length" :key="`end-${index}`" :value="index - 1">第 {{ index }} 词</option>
+              </select>
+            </label>
+          </div>
+          <div class="rate-row" role="group" aria-label="语速选择">
+            <button v-for="option in rateOptions" :key="option" class="rate-chip" :class="{ active: loopRate === option }" @click="setLoopRate(option)">{{ option }}×</button>
+          </div>
+          <var-button v-if="!player.looping" block type="primary" :disabled="!currentWords.length" @click="startLoop">循环播放片段</var-button>
+          <var-button v-else block type="danger" @click="stopLoop">停止循环</var-button>
+          <p class="loop-tip">播到终点词自动回到起点，点停止结束；调速从下一遍生效。</p>
+          <p v-if="player.reason" class="loop-warning">{{ player.reason }}</p>
         </section>
 
         <div class="dictation-label"><strong>输入听到的内容</strong><span>答案在本机自动保存</span></div>
@@ -377,9 +502,12 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-if="resultSentence.tokens.some((token) => !token.correct)" style="margin-top: 18px">
-            <div class="dictation-label"><strong>错误分类与原因</strong><span>会被写入本地记录</span></div>
+            <div class="dictation-label"><strong>错误分类与原因</strong><button class="text-button" @click="bringErrorsToLoop(resultSentence)">全部错误带入循环区间</button></div>
             <div v-for="token in resultSentence.tokens.filter((item) => !item.correct)" :key="`edit-${token.index}`" class="feedback-card">
-              <strong>{{ token.expected || `多出的词：${token.actual}` }}</strong>
+              <div class="token-card-head">
+                <strong>{{ token.expected || `多出的词：${token.actual}` }}</strong>
+                <button class="text-button" @click="bringErrorsToLoop(resultSentence, token)">循环此词</button>
+              </div>
               <div style="display: grid; grid-template-columns: 120px 1fr; gap: 8px; margin-top: 9px">
                 <select :value="token.category" @change="saveClassification(resultAttempt.id, resultSentence.sentenceId, token.index, ($event.target as HTMLSelectElement).value as ErrorCategory, token.reason)">
                   <option v-for="option in categoryOptions" :key="option.value" :value="option.value">{{ option.label }}</option>

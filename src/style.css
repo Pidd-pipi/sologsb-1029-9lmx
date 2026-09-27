@@ -84,6 +84,19 @@ button, input, textarea { font: inherit; }
 .audio-meta { display: flex; align-items: center; gap: 15px; position: relative; z-index: 1; }
 .audio-meta strong { display: block; margin-bottom: 7px; }
 .audio-meta p { margin: 0; color: #bbc7d9; font-size: .72rem; line-height: 1.5; }
+.loop-panel { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 16px; margin-bottom: 14px; box-shadow: 0 8px 26px rgb(28 44 72 / .06); }
+.loop-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: .8rem; margin-bottom: 12px; }
+.loop-head span { color: var(--muted); font-size: .68rem; }
+.loop-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 12px; }
+.loop-field { display: flex; align-items: center; gap: 8px; font-size: .72rem; color: var(--muted); }
+.loop-field select { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--app-bg); color: var(--text); padding: 9px 10px; }
+.rate-row { display: flex; gap: 8px; margin-bottom: 12px; }
+.rate-chip { flex: 1; border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 11px; padding: 9px 0; cursor: pointer; font-size: .75rem; }
+.rate-chip.active { background: var(--primary); border-color: var(--primary); color: white; font-weight: 700; }
+.loop-tip { margin: 10px 0 0; color: var(--muted); font-size: .66rem; line-height: 1.5; }
+.loop-warning { margin: 10px 0 0; color: var(--danger); font-size: .68rem; line-height: 1.5; }
+.text-button { border: 0; background: transparent; color: var(--primary); cursor: pointer; font-size: .7rem; padding: 4px 0; white-space: nowrap; }
+.token-card-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .dictation-label { display: flex; justify-content: space-between; align-items: center; margin: 18px 2px 8px; font-size: .8rem; }
 .dictation-label span { color: var(--muted); font-size: .68rem; }
 .answer-box { width: 100%; min-height: 120px; resize: vertical; border: 1.5px solid var(--line); border-radius: 17px; padding: 14px; background: var(--card); color: var(--text); line-height: 1.65; outline: none; }

@@ -63,6 +63,12 @@ export interface LessonProgress {
   updatedAt: string;
 }
 
+export interface SegmentPreference {
+  start: number;
+  end: number;
+  rate: number;
+}
+
 export interface PersistedState {
   schemaVersion: 1;
   courses: Course[];
@@ -70,6 +76,7 @@ export interface PersistedState {
   progress: Record<string, LessonProgress>;
   activeLessonId: string;
   activeSentenceId: string;
+  segmentPrefs: Record<string, SegmentPreference>;
   theme: ThemeMode;
   fontScale: number;
   role: 'learner' | 'teacher';
