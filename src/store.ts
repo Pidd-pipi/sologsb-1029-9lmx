@@ -9,7 +9,13 @@ function loadState(): PersistedState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as PersistedState;
-      if (parsed.schemaVersion === 1) return parsed;
+      if (parsed.schemaVersion === 1) {
+        // 兼容旧版本保存的进度（没有按句播放配置）。
+        Object.values(parsed.progress).forEach((progress) => {
+          if (!progress.playback) progress.playback = {};
+        });
+        return parsed;
+      }
     }
   } catch {
     // Falls back to the sample course when the local draft is malformed.

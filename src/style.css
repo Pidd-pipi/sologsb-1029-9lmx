@@ -81,6 +81,24 @@ button, input, textarea { font: inherit; }
 .audio-card { position: relative; overflow: hidden; margin-bottom: 14px; background: linear-gradient(145deg, #202b3c, #101722); color: white; border-radius: 22px; padding: 22px 19px; }
 .audio-card::after { content: ''; position: absolute; width: 170px; height: 170px; border-radius: 50%; background: rgb(93 155 255 / .13); right: -65px; top: -70px; }
 .play-button { width: 68px; height: 68px; border: 0; border-radius: 50%; background: var(--primary); color: white; font-size: 1.45rem; cursor: pointer; box-shadow: 0 12px 30px rgb(23 105 224 / .4); }
+.play-button.looping { background: var(--danger); box-shadow: 0 12px 30px rgb(216 59 69 / .4); }
+.play-button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+.loop-panel { position: relative; z-index: 1; margin-top: 16px; display: grid; gap: 10px; }
+.rate-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.loop-label { font-size: .7rem; color: #bbc7d9; }
+.step-button { width: 34px; height: 34px; border-radius: 10px; border: 1px solid rgb(255 255 255 / .25); background: rgb(255 255 255 / .08); color: white; font-size: 1rem; line-height: 1; cursor: pointer; }
+.step-button:disabled { opacity: .4; cursor: not-allowed; }
+.rate-value { font-size: .95rem; min-width: 58px; text-align: center; }
+.loop-hint { flex: 1 1 130px; font-size: .66rem; color: #9fb4d8; line-height: 1.4; }
+.range-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; }
+.range-row label { display: grid; gap: 5px; font-size: .66rem; color: #bbc7d9; }
+.range-row select { width: 100%; border: 1px solid rgb(255 255 255 / .22); background: rgb(255 255 255 / .08); color: white; border-radius: 11px; padding: 9px 10px; font-size: .78rem; }
+.range-row select option { color: #17233d; }
+.ghost-button { border: 1px solid rgb(255 255 255 / .25); background: transparent; color: white; border-radius: 11px; padding: 9px 12px; font-size: .72rem; cursor: pointer; }
+.range-preview { margin: 0; font-size: .72rem; color: #9fb4d8; line-height: 1.5; word-break: break-word; }
+.error-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.mini-button { border: 1px solid var(--primary); background: transparent; color: var(--primary); border-radius: 999px; padding: 5px 11px; font-size: .66rem; cursor: pointer; white-space: nowrap; }
+.speech-warning { color: var(--danger); font-size: .7rem; margin: 0 0 8px; }
 .audio-meta { display: flex; align-items: center; gap: 15px; position: relative; z-index: 1; }
 .audio-meta strong { display: block; margin-bottom: 7px; }
 .audio-meta p { margin: 0; color: #bbc7d9; font-size: .72rem; line-height: 1.5; }
@@ -104,6 +122,7 @@ button, input, textarea { font: inherit; }
 .word-list { display: flex; flex-wrap: wrap; gap: 7px; }
 .word-chip { border: 0; border-radius: 11px; padding: 8px 10px; background: #e8f7f1; color: var(--success); cursor: pointer; }
 .word-chip.wrong { background: #fff0f0; color: var(--danger); text-decoration: line-through; }
+.word-chip:disabled { opacity: .5; cursor: not-allowed; }
 .word-chip small { display: block; font-size: .59rem; text-decoration: none; opacity: .8; margin-top: 2px; }
 .detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
 .detail-head h3 { margin: 0; }

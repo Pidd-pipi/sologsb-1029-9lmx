@@ -1,19 +1,41 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
+import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView, SentenceAttempt, SentencePlayback } from './types';
 import { compareSentence, scoreAttempt, segmentText } from './utils';
+import { useSegmentPlayer } from './composables/useSegmentPlayer';
+
+const DEFAULT_RATE = 0.72;
+const RATE_STEP = 0.05;
+const RATE_MIN = 0.5;
+const RATE_MAX = 1.2;
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
 const online = ref(navigator.onLine);
 const toast = ref('');
 const resultAttemptId = ref('');
 const selectedResultSentence = ref(0);
-const segmentStart = ref(0);
-const segmentEnd = ref(1);
+const resultStart = ref(0);
+const resultEnd = ref(0);
+// 练习页按句记忆的语速与起止词（同时写入本地进度，刷新/旋转后恢复）。
+const practiceStart = ref(0);
+const practiceEnd = ref(0);
+const practiceRate = ref(DEFAULT_RATE);
+// 当前循环是否在播放；true 时一遍播完会回到起点再来一遍。
+const looping = ref(false);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
 let toastTimer = 0;
+// 当前这一遍使用的语速：调速时不打断当前一遍，下一遍才按新速度。
+let currentPassRate = DEFAULT_RATE;
+
+const {
+  supported: speechSupported,
+  speaking: speechActive,
+  unavailableReason,
+  speakOnce,
+  stop: stopSpeech
+} = useSegmentPlayer();
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
 const activeCourse = computed(() => activeLesson.value ? courseForLesson(activeLesson.value.id) : undefined);
@@ -39,6 +61,17 @@ const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.i
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
 
+const practiceTokens = computed(() => segmentText(currentSentence.value?.text ?? ''));
+const rangeLow = computed(() => Math.min(practiceStart.value, practiceEnd.value));
+const rangeHigh = computed(() => Math.max(practiceStart.value, practiceEnd.value));
+const rangePreview = computed(() => practiceTokens.value.slice(rangeLow.value, rangeHigh.value + 1).map((token) => token.display).join(' '));
+const rateHint = computed(() => {
+  if (!speechSupported) return unavailableReason.value || '语音播放不可用';
+  if (looping.value && Math.abs(currentPassRate - practiceRate.value) > 0.001) return '当前一遍继续原速，下一遍按新速度';
+  if (looping.value) return '到结束词自动回到起点，点停止结束';
+  return '语速和起止词会按句记住';
+});
+
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
   { value: 'spelling', label: '拼写错误' },
@@ -48,32 +81,76 @@ const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'grammar', label: '语法' }
 ];
 
+function clampRate(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_RATE;
+  return Math.min(RATE_MAX, Math.max(RATE_MIN, Number(value.toFixed(2))));
+}
+
+function clampIndex(value: number, length: number): number {
+  if (length <= 0) return 0;
+  if (!Number.isFinite(value)) return length - 1;
+  return Math.min(length - 1, Math.max(0, Math.round(value)));
+}
+
+function defaultPlayback(length: number): SentencePlayback {
+  return { rate: DEFAULT_RATE, start: 0, end: Math.max(0, length - 1) };
+}
+
+// 切句时停止旧播放，并恢复该句上次保存的语速与起止词（保持暂停）。
 watch(currentSentence, (sentence) => {
+  stopLoop();
+  const tokens = segmentText(sentence?.text ?? '');
+  const saved = sentence ? activeProgress.value?.playback?.[sentence.id] : undefined;
+  const config = saved ?? defaultPlayback(tokens.length);
   currentAnswer.value = sentence && activeProgress.value ? activeProgress.value.answers[sentence.id] ?? '' : '';
-  segmentStart.value = 0;
-  segmentEnd.value = sentence ? Math.max(0, segmentText(sentence.text).length - 1) : 0;
+  practiceRate.value = clampRate(config.rate);
+  practiceStart.value = clampIndex(config.start, tokens.length);
+  practiceEnd.value = clampIndex(config.end, tokens.length);
 }, { immediate: true });
 
 watch(currentAnswer, (value) => {
   const lesson = activeLesson.value;
   const sentence = currentSentence.value;
   if (!lesson || !sentence) return;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString() };
+  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString(), playback: {} };
   progress.answers[sentence.id] = value;
   progress.activeSentenceId = sentence.id;
   progress.updatedAt = new Date().toISOString();
   state.progress[lesson.id] = progress;
 });
 
+// 语速与起止词变化时写回该句配置，旋转或刷新后可以恢复（仍保持暂停）。
+watch([practiceRate, practiceStart, practiceEnd], () => {
+  const lesson = activeLesson.value;
+  const sentence = currentSentence.value;
+  if (!lesson || !sentence) return;
+  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString(), playback: {} };
+  if (!progress.playback) progress.playback = {};
+  progress.playback[sentence.id] = { rate: practiceRate.value, start: practiceStart.value, end: practiceEnd.value };
+  state.progress[lesson.id] = progress;
+});
+
+// 播放中调整起止词：结束旧播放，下一次播放使用新区间；调速不在这里停止。
+watch([practiceStart, practiceEnd], () => {
+  if (looping.value) stopLoop();
+});
+
 watch(activeLesson, (lesson) => {
   if (!lesson) return;
   state.activeLessonId = lesson.id;
   state.activeSentenceId = currentSentence.value?.id ?? lesson.sentences[0].id;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
+  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString(), playback: {} };
+  if (!progress.playback) progress.playback = {};
   if (!lesson.sentences.some((sentence) => sentence.id === progress.activeSentenceId)) progress.activeSentenceId = lesson.sentences[0].id;
   state.progress[lesson.id] = progress;
   state.activeSentenceId = progress.activeSentenceId;
   currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
+});
+
+// 提交、返回课程库或转入后台都会离开播放语境，统一停止旧播放。
+watch(view, () => {
+  stopSpeech();
+  looping.value = false;
 });
 
 watch(teacherAttemptId, (id) => {
@@ -87,7 +164,8 @@ function notify(message: string) {
 }
 
 function startLesson(lesson: Lesson) {
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
+  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString(), playback: {} };
+  if (!progress.playback) progress.playback = {};
   state.progress[lesson.id] = progress;
   state.activeLessonId = lesson.id;
   state.activeSentenceId = progress.activeSentenceId || lesson.sentences[0].id;
@@ -110,10 +188,83 @@ function goToSentence(index: number) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+function segmentSpeechText(start: number, end: number, source: string): string {
+  const tokens = segmentText(source);
+  const lo = clampIndex(Math.min(start, end), tokens.length);
+  const hi = clampIndex(Math.max(start, end), tokens.length);
+  return tokens.slice(lo, hi + 1).map((token) => token.display).join(' ');
+}
+
+function runPass() {
+  const text = rangePreview.value;
+  // 只在每一遍开始时取语速：当前一遍不被调速打断。
+  currentPassRate = practiceRate.value;
+  speakOnce({
+    text,
+    rate: currentPassRate,
+    onEnd: () => {
+      // 到结束词：循环仍开着就回到起点按（可能更新过的）语速再来一遍。
+      if (looping.value) runPass();
+    },
+    onError: () => {
+      looping.value = false;
+      notify('语音播放被中断，可能缺少语音包，请重新播放');
+    }
+  });
+}
+
+function startLoop() {
+  if (!speechSupported) {
+    notify(unavailableReason.value || '当前设备无法使用语音播放');
+    return;
+  }
+  if (!rangePreview.value.trim()) {
+    notify('所选区间没有可播放的词');
+    return;
+  }
+  looping.value = true;
+  runPass();
+}
+
+function stopLoop() {
+  looping.value = false;
+  stopSpeech();
+}
+
+function toggleLoop() {
+  if (looping.value) stopLoop();
+  else startLoop();
+}
+
+function changeRate(delta: number) {
+  practiceRate.value = clampRate(practiceRate.value + delta);
+}
+
+function resetRange() {
+  const tokens = practiceTokens.value;
+  practiceStart.value = 0;
+  practiceEnd.value = Math.max(0, tokens.length - 1);
+}
+
+// 完整听写：整句只播一遍，速度沿用该句记住的语速。
+function playFullOnce() {
+  if (!speechSupported) {
+    notify(unavailableReason.value || '当前设备无法使用语音播放');
+    return;
+  }
+  looping.value = false;
+  speakOnce({
+    text: currentSentence.value?.text ?? '',
+    rate: practiceRate.value,
+    onError: () => notify('整句播放失败，设备可能缺少语音包')
+  });
+}
+
 function submitLesson() {
   const lesson = activeLesson.value;
   const course = activeCourse.value;
   if (!lesson || !course) return;
+  stopLoop();
   const progress = state.progress[lesson.id];
   const answeredCount = lesson.sentences.filter((sentence) => (progress?.answers[sentence.id] ?? '').trim()).length;
   if (!answeredCount) {
@@ -141,40 +292,91 @@ function submitLesson() {
   saveAttempt(attempt);
   resultAttemptId.value = attempt.id;
   selectedResultSentence.value = 0;
-  syncSegment();
+  syncResultSegment();
   view.value = 'result';
   persist();
   notify('已提交，逐词结果已生成');
 }
 
-function syncSegment() {
+function syncResultSegment() {
   const tokenCount = segmentText(resultSentence.value?.source ?? '').length;
-  segmentStart.value = 0;
-  segmentEnd.value = Math.max(0, tokenCount - 1);
+  resultStart.value = 0;
+  resultEnd.value = Math.max(0, tokenCount - 1);
 }
 
-function replay(text: string, rate = 0.82) {
-  if (!('speechSynthesis' in window)) {
-    notify('当前浏览器不支持语音播放');
+// 结果页比对结果里“多词”会占用序列位置，错误词要映射回源句中的词序。
+function sourceIndexOf(attempt: SentenceAttempt, tokenIndex: number): number {
+  let position = 0;
+  for (let i = 0; i < tokenIndex && i < attempt.tokens.length; i += 1) {
+    if (attempt.tokens[i].expected) position += 1;
+  }
+  return position;
+}
+
+// 结果页：单击单词/错误词只播一遍，不做循环。
+function replayWord(text: string) {
+  if (!speechSupported) {
+    notify(unavailableReason.value || '当前设备无法使用语音播放');
     return;
   }
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'en-US';
-  utterance.rate = rate;
-  window.speechSynthesis.speak(utterance);
+  speakOnce({
+    text,
+    rate: 0.75,
+    onError: () => notify('该词播放失败，设备可能缺少语音包')
+  });
 }
 
-function replaySegment() {
-  const tokens = segmentText(resultSentence.value?.source ?? '');
-  const start = Math.min(segmentStart.value, segmentEnd.value);
-  const end = Math.max(segmentStart.value, segmentEnd.value);
-  replay(tokens.slice(start, end + 1).map((token) => token.display).join(' '), 0.72);
+function replayResultSegment() {
+  const sentence = resultSentence.value;
+  if (!sentence) return;
+  if (!speechSupported) {
+    notify(unavailableReason.value || '当前设备无法使用语音播放');
+    return;
+  }
+  speakOnce({
+    text: segmentSpeechText(resultStart.value, resultEnd.value, sentence.source),
+    rate: 0.72,
+    onError: () => notify('片段播放失败，设备可能缺少语音包')
+  });
+}
+
+// 结果页错误词/所选区间一键带回练习页同一区间（练习页保持暂停）。
+function bringToPractice(sentenceId: string, start: number, end: number) {
+  const attempt = resultAttempt.value;
+  const lesson = attempt ? lessonById(attempt.lessonId) : undefined;
+  const sentence = lesson?.sentences.find((item) => item.id === sentenceId);
+  if (!attempt || !lesson || !sentence) {
+    notify('课程内容已变化，无法回到该句练习');
+    return;
+  }
+  stopSpeech();
+  const tokens = segmentText(sentence.text);
+  const lo = clampIndex(Math.min(start, end), tokens.length);
+  const hi = clampIndex(Math.max(start, end), tokens.length);
+  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString(), playback: {} };
+  if (!progress.playback) progress.playback = {};
+  const previous = progress.playback[sentence.id] ?? defaultPlayback(tokens.length);
+  progress.playback[sentence.id] = { rate: clampRate(previous.rate), start: lo, end: hi };
+  progress.activeSentenceId = sentence.id;
+  progress.updatedAt = new Date().toISOString();
+  state.progress[lesson.id] = progress;
+  state.activeLessonId = lesson.id;
+  state.activeSentenceId = sentence.id;
+  currentAnswer.value = progress.answers[sentence.id] ?? '';
+  practiceRate.value = clampRate(previous.rate);
+  practiceStart.value = lo;
+  practiceEnd.value = hi;
+  looping.value = false;
+  view.value = 'practice';
+  persist();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  notify('已带入同一区间，按播放即可反复重听');
 }
 
 function selectResultSentence(index: number) {
+  stopSpeech();
   selectedResultSentence.value = index;
-  syncSegment();
+  syncResultSegment();
 }
 
 function saveClassification(attemptId: string, sentenceId: string, tokenIndex: number, category: ErrorCategory, reason: string) {
@@ -213,27 +415,55 @@ function formatDate(value: string): string {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+function refreshVoiceAvailability() {
+  if (!speechSupported) return;
+  const voices = window.speechSynthesis.getVoices();
+  unavailableReason.value = voices.length === 0 ? '没有检测到可用语音包，设备可能未安装 TTS 语音' : '';
+}
+
 function onConnectionChange() {
   online.value = navigator.onLine;
   persist();
 }
 
 function onVisibilityChange() {
-  if (document.visibilityState === 'hidden') persist();
+  if (document.visibilityState === 'hidden') {
+    stopLoop();
+    persist();
+  }
+}
+
+// 旋转时停止旧播放；配置已持久化，回来后仍处于暂停并可恢复语速/起止词。
+const orientationMedia = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(orientation: portrait)')
+  : undefined;
+function onOrientationChange() {
+  stopLoop();
 }
 
 onMounted(() => {
   window.addEventListener('online', onConnectionChange);
   window.addEventListener('offline', onConnectionChange);
   window.addEventListener('visibilitychange', onVisibilityChange);
-  window.addEventListener('pagehide', persist);
+  window.addEventListener('pagehide', stopLoop);
+  window.addEventListener('orientationchange', onOrientationChange);
+  orientationMedia?.addEventListener?.('change', onOrientationChange);
+  if (speechSupported) {
+    refreshVoiceAvailability();
+    window.speechSynthesis.onvoiceschanged = refreshVoiceAvailability;
+    window.setTimeout(refreshVoiceAvailability, 600);
+  }
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('online', onConnectionChange);
   window.removeEventListener('offline', onConnectionChange);
   window.removeEventListener('visibilitychange', onVisibilityChange);
-  window.removeEventListener('pagehide', persist);
+  window.removeEventListener('pagehide', stopLoop);
+  window.removeEventListener('orientationchange', onOrientationChange);
+  orientationMedia?.removeEventListener?.('change', onOrientationChange);
+  if (speechSupported) window.speechSynthesis.onvoiceschanged = null;
+  stopLoop();
   persist();
 });
 </script>
@@ -317,15 +547,41 @@ onBeforeUnmount(() => {
 
         <section class="audio-card">
           <div class="audio-meta">
-            <button class="play-button" aria-label="播放当前句子" @click="replay(currentSentence?.text ?? '')">▶</button>
-            <div><strong>听写提示</strong><p>先完整播放，再输入你听到的英文。播放速度已放慢。</p></div>
+            <button class="play-button" :class="{ looping }" :aria-label="looping ? '停止循环播放' : '循环播放所选片段'" :disabled="!speechSupported" @click="toggleLoop">{{ looping ? '■' : '▶' }}</button>
+            <div>
+              <strong>{{ looping ? '正在循环播放' : speechActive ? '正在播放' : '片段循环' }}</strong>
+              <p>{{ looping ? '到结束词自动回到起点，点左侧停止结束。' : '先反复听一小段，再回到整句听写。' }}</p>
+            </div>
+          </div>
+          <div class="loop-panel">
+            <div class="rate-row">
+              <span class="loop-label">语速</span>
+              <button class="step-button" aria-label="减慢语速" :disabled="!speechSupported" @click="changeRate(-RATE_STEP)">−</button>
+              <strong class="rate-value">{{ practiceRate.toFixed(2) }}×</strong>
+              <button class="step-button" aria-label="加快语速" :disabled="!speechSupported" @click="changeRate(RATE_STEP)">＋</button>
+              <span class="loop-hint">{{ rateHint }}</span>
+            </div>
+            <div class="range-row">
+              <label>起点词
+                <select v-model.number="practiceStart" aria-label="片段起点词">
+                  <option v-for="token in practiceTokens" :key="`ps-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option>
+                </select>
+              </label>
+              <label>结束词
+                <select v-model.number="practiceEnd" aria-label="片段结束词">
+                  <option v-for="token in practiceTokens" :key="`pe-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option>
+                </select>
+              </label>
+              <button class="ghost-button" @click="resetRange">整句</button>
+            </div>
+            <p class="range-preview">“{{ rangePreview }}”</p>
           </div>
         </section>
 
         <div class="dictation-label"><strong>输入听到的内容</strong><span>答案在本机自动保存</span></div>
         <textarea v-model="currentAnswer" class="answer-box" :aria-label="`第 ${currentIndex + 1} 句听写答案`" placeholder="Type what you hear..." @keydown.ctrl.enter="submitLesson" @keydown.meta.enter="submitLesson"></textarea>
         <div class="practice-actions">
-          <var-button block type="default" variant="outline" @click="replay(currentSentence?.text ?? '')">再听一次</var-button>
+          <var-button block type="default" variant="outline" :disabled="!speechSupported" @click="playFullOnce">整句听一遍</var-button>
           <var-button block type="primary" @click="submitLesson">提交本次听写</var-button>
         </div>
 
@@ -349,7 +605,7 @@ onBeforeUnmount(() => {
         <section class="panel result-score">
           <div class="score-ring" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
           <h2>{{ resultAttempt.score >= 90 ? '几乎完美' : resultAttempt.score >= 70 ? '继续打磨细节' : '再听一遍会更好' }}</h2>
-          <p>{{ resultAttempt.lessonTitle }} · 点击红色词可单独重听，并记录错误原因。</p>
+          <p>{{ resultAttempt.lessonTitle }} · 点击单词可重听，错误词还能带入练习页同一区间反复听。</p>
         </section>
 
         <div class="sentence-picker">
@@ -362,24 +618,29 @@ onBeforeUnmount(() => {
             <span class="history-score">{{ resultSentence.score }}%</span>
           </div>
           <div class="word-list">
-            <button v-for="token in resultSentence.tokens" :key="`${token.index}-${token.expected}-${token.actual}`" class="word-chip" :class="{ wrong: !token.correct }" :title="token.correct ? '点击重听' : `你的答案：${token.actual || '未输入'}`" @click="replay(token.expected || token.actual, 0.7)">
+            <button v-for="token in resultSentence.tokens" :key="`${token.index}-${token.expected}-${token.actual}`" class="word-chip" :class="{ wrong: !token.correct }" :disabled="!speechSupported" :title="token.correct ? '点击重听' : `你的答案：${token.actual || '未输入'}`" @click="replayWord(token.expected || token.actual)">
               {{ token.expected || `[+${token.actual}]` }}<small v-if="!token.correct">{{ token.actual || '漏词' }}</small>
             </button>
           </div>
 
           <div v-if="resultSentence.tokens.some((token) => !token.correct)" style="margin-top: 18px">
             <div class="dictation-label"><strong>片段重听</strong><span>选择起止词后播放</span></div>
+            <p v-if="!speechSupported" class="speech-warning">{{ unavailableReason || '语音播放不可用' }}</p>
             <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center">
-              <select v-model.number="segmentStart" aria-label="片段起点"><option v-for="token in segmentText(resultSentence.source)" :key="`s-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option></select>
-              <select v-model.number="segmentEnd" aria-label="片段终点"><option v-for="token in segmentText(resultSentence.source)" :key="`e-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option></select>
-              <var-button type="primary" size="small" @click="replaySegment">播放片段</var-button>
+              <select v-model.number="resultStart" aria-label="片段起点"><option v-for="token in segmentText(resultSentence.source)" :key="`s-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option></select>
+              <select v-model.number="resultEnd" aria-label="片段终点"><option v-for="token in segmentText(resultSentence.source)" :key="`e-${token.index}`" :value="token.index">{{ token.index + 1 }} · {{ token.display }}</option></select>
+              <var-button type="primary" size="small" :disabled="!speechSupported" @click="replayResultSegment">播放片段</var-button>
             </div>
+            <var-button block size="small" variant="outline" style="margin-top: 9px" @click="bringToPractice(resultSentence.sentenceId, resultStart, resultEnd)">把这一区间带入练习页反复听</var-button>
           </div>
 
           <div v-if="resultSentence.tokens.some((token) => !token.correct)" style="margin-top: 18px">
             <div class="dictation-label"><strong>错误分类与原因</strong><span>会被写入本地记录</span></div>
             <div v-for="token in resultSentence.tokens.filter((item) => !item.correct)" :key="`edit-${token.index}`" class="feedback-card">
-              <strong>{{ token.expected || `多出的词：${token.actual}` }}</strong>
+              <div class="error-head">
+                <strong>{{ token.expected || `多出的词：${token.actual}` }}</strong>
+                <button v-if="token.expected" class="mini-button" @click="bringToPractice(resultSentence.sentenceId, sourceIndexOf(resultSentence, token.index), sourceIndexOf(resultSentence, token.index))">带入练习重听</button>
+              </div>
               <div style="display: grid; grid-template-columns: 120px 1fr; gap: 8px; margin-top: 9px">
                 <select :value="token.category" @change="saveClassification(resultAttempt.id, resultSentence.sentenceId, token.index, ($event.target as HTMLSelectElement).value as ErrorCategory, token.reason)">
                   <option v-for="option in categoryOptions" :key="option.value" :value="option.value">{{ option.label }}</option>

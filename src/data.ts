@@ -103,7 +103,8 @@ export const createInitialState = (): PersistedState => ({
     'airport-01': {
       answers: { 'airport-01-s1': 'I would like to check in for my flight to London' },
       activeSentenceId: 'airport-01-s2',
-      updatedAt: '2026-09-24T10:10:00.000Z'
+      updatedAt: '2026-09-24T10:10:00.000Z',
+      playback: {}
     }
   },
   activeLessonId: '',

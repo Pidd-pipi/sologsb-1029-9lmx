@@ -57,10 +57,17 @@ export interface PracticeAttempt {
   teacherFeedback: string;
 }
 
+export interface SentencePlayback {
+  rate: number;
+  start: number;
+  end: number;
+}
+
 export interface LessonProgress {
   answers: Record<string, string>;
   activeSentenceId: string;
   updatedAt: string;
+  playback: Record<string, SentencePlayback>;
 }
 
 export interface PersistedState {
